@@ -2,5 +2,5 @@
 
 # Variational Autoencoder (VAE)
 
-Source code for generating thumbnail images of cells from multi-channel TIFF
+Source code for generating thumbnail images of cells from a multi-channel TIFF
 image, training a VAE model, and performing clustering on latent space vectors.
