@@ -52,6 +52,8 @@ def chunks(lst, thumbs_per_batch):
 
 
 def transposeZarr(z):
+    """Re-organizes thumbnail dimensions as expected VAE input
+       (i.e. cells, x, y, channels)."""
     view = DatasetView(z)
     result = view.lazy_transpose([1, 2, 3, 0])
 
@@ -160,9 +162,10 @@ def batch_generator(X, batch_size, steps):
 
         if step_counter <= steps:
 
-            batch = X[:, idx_start:idx_stop, :, :]  # creates numpy array
+            # first isolate a batch of zarr thumbnails (unit16) as numpy array
+            batch = X[:, idx_start:idx_stop, :, :]
 
-            # convert back to Zarr format
+            # then convert the batch back to Zarr format, but save as float32
             z = zarr.zeros(
                 shape=(batch.shape[0], batch.shape[1],
                        batch.shape[2], batch.shape[3]),
@@ -184,27 +187,27 @@ def batch_generator(X, batch_size, steps):
             # augment batch data
             for i in range(batch.shape[0]):
 
-                # one of 4 rotation angles
-                rand_rot = random.choice([0, 1, 2, 3])
-                batch[i] = np.rot90(batch[i], k=rand_rot, axes=(0, 1))
-
-                # flip left or right
-                flip_lr = random.choice([0, 1])
-                if flip_lr:
-                    batch[i] = np.fliplr(batch[i])
-
-                # flip up or down
-                flip_ud = random.choice([0, 1])
-                if flip_ud:
-                    batch[i] = np.flipud(batch[i])
+                # # one of 4 rotation angles
+                # rand_rot = random.choice([0, 1, 2, 3])
+                # batch[i] = np.rot90(batch[i], k=rand_rot, axes=(0, 1))
+                #
+                # # flip left or right
+                # flip_lr = random.choice([0, 1])
+                # if flip_lr:
+                #     batch[i] = np.fliplr(batch[i])
+                #
+                # # flip up or down
+                # flip_ud = random.choice([0, 1])
+                # if flip_ud:
+                #     batch[i] = np.flipud(batch[i])
 
                 # log-transform
                 batch[i] = np.log10(batch[i], where=(batch[i] != 0))
 
+                # normalize 0.17th and 99.99th percentiles 0-1, per channel
                 for e, (lower_cutoff_log, upper_cutoff_log) in enumerate(
                   cutoffs.values()):
 
-                    # scale 0.17th and 99.99th percentile between 0 and 1
                     batch[i, :, :, e] = (
                         (((1-0)*(batch[i, :, :, e].ravel()-lower_cutoff_log)) /
                          (upper_cutoff_log-lower_cutoff_log)
@@ -257,7 +260,7 @@ def TrainVAE(img_shape, training_epochs, learning_rate):
     shape_before_flattening = K.int_shape(x)
 
     x = layers.Flatten()(x)
-    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dense(850, activation='relu')(x)  # was 32
 
     # two outputs, latent mean and (log)variance
     z_mu = layers.Dense(latent_dim, name='z_mu')(x)
@@ -385,34 +388,30 @@ batch_size = 32
 ###############################################################################
 
 # save directory
-save_dir = '/Users/greg/projects/vae_sardana-097/5_train_vae'
+save_dir = '/Users/greg/projects/vae/output/5_train_vae'
 if not os.path.exists(save_dir):
     os.mkdir(save_dir)
 
-shuffled_batch_dir = (
-    '/Users/greg/projects/vae_sardana-097/5_train_vae/'
-    'shuffled_thumbnail_batches'
-    )
+shuffled_batch_dir = os.path.join(save_dir, 'shuffled_thumbnail_batches')
 
-concatenated_batch_dir = (
-    '/Users/greg/projects/vae_sardana-097/5_train_vae/'
-    'concatenated_shuffled_thumbnails'
+concatenated_batch_dir = os.path.join(
+    save_dir, 'concatenated_shuffled_thumbnails'
     )
 
 tensorboard_log_dir = os.path.join(save_dir, 'tensorboard_logs/fit')
 
 ###############################################################################
 
-# read floating point augmented training thumbnails
+# read training thumbnails (16-bit unsigned integer format)
 z1_train_path = (
-    '/Users/greg/projects/vae_sardana-097/2_cellcutter_output_win30/' +
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
     'train_thumbnails_30'
     )
 X_train = zarr.open(z1_train_path)
 
-# read floating point validation thumbnails
+# read validation thumbnails (16-bit unsigned integer format)
 z1_validate_path = (
-    '/Users/greg/projects/vae_sardana-097/2_cellcutter_output_win30/' +
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
     'validate_thumbnails_30'
     )
 X_valid = zarr.open(z1_validate_path)
@@ -423,15 +422,15 @@ X_valid = zarr.open(z1_validate_path)
 # X_train1 = X_train[:, 0:10000, :, :]
 # X_valid1 = X_valid[:, 0:10000, :, :]
 
-# or read the full training and validation datasets from Zarr files
+# or read the full training and validation datasets
 X_train1 = X_train
 X_valid1 = X_valid
 
 ###############################################################################
 
-# read percentile cutoffs selected in script 3_feature_preprocessing
+# read percentile cutoffs selected in script 4_feature_preprocessing_selections
 with open(
-  '/Users/greg/projects/vae_sardana-097/4_feature_preprocessing_selections'
+  '/Users/greg/projects/vae/output/4_feature_preprocessing_selections'
   '/cutoffs.pkl',
   'rb') as handle:
     cutoffs = pickle.load(handle)
@@ -453,6 +452,6 @@ validation_batch_generator = batch_generator(
 # train VAE
 (encoder, decoder, z_mu) = TrainVAE(
     img_shape=(X_train1.shape[2], X_train1.shape[3], X_train1.shape[0]),
-    learning_rate=0.03,  # 0.0008 try higher and adaptive learning rates
+    learning_rate=0.001,  # 0.0008 try higher and adaptive learning rates
     training_epochs=100
     )

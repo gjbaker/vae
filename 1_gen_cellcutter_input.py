@@ -4,7 +4,7 @@ import pandas as pd
 ###############################################################################
 
 # save directory
-save_dir = '/Users/greg/projects/vae_sardana-097/1_cellcutter_input'
+save_dir = '/Users/greg/projects/vae/output/1_cellcutter_input'
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
 
@@ -29,6 +29,7 @@ sample_weights = pd.DataFrame({'weights': 1 / (groups.size() * len(groups))})
 weights = pd.merge(
     csv[['cluster']], sample_weights, left_on='cluster', right_index=True
     )
+
 csv = csv.sample(
     frac=F, replace=False, weights=weights['weights'], random_state=0, axis=0
     )

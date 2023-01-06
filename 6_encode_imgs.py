@@ -1,9 +1,11 @@
 import os
 import sys
 from datetime import datetime
+import yaml
 
 import pandas as pd
 import numpy as np
+import math
 from math import ceil
 from math import floor
 
@@ -15,6 +17,9 @@ from matplotlib.lines import Line2D
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from matplotlib.widgets import LassoSelector
 from matplotlib.path import Path
+from matplotlib.colors import ListedColormap
+from matplotlib import colors
+from matplotlib.colors import to_rgb
 
 import matplotlib.gridspec as gridspec
 
@@ -34,6 +39,8 @@ import pickle
 
 
 def transposeZarr(z):
+    """Re-organizes thumbnail dimensions as expected VAE input
+       (i.e. cells, x, y, channels)."""
     view = DatasetView(z)
     result = view.lazy_transpose([1, 2, 3, 0])
 
@@ -47,40 +54,53 @@ def EncodeImgs(X, encoder):
     return X_encoded
 
 
-def reverse_log(channel):
+def reverse_log(channel_slice, channel_name):
+    """Reverses percentile normalization and log10-transformation,
+       pixel outliers remained clipped)."""
 
-    # undo percentile scale
-    channel = (
-        (((upper_cutoff_log-lower_cutoff_log)*(channel.ravel()-0)) /
+    lower_cutoff_log, upper_cutoff_log = cutoffs[channel_name]
+
+    # reverse percentile normalization
+    channel_slice = (
+        (((upper_cutoff_log-lower_cutoff_log)*(channel_slice-0)) /
          (1-0)
-         ) + lower_cutoff_log).reshape(channel.shape)
+         ) + lower_cutoff_log)
 
-    # exponentiate to undo log10-transform
-    channel = 10 ** channel
+    # reverse log10-transform
+    channel_slice = np.rint(10 ** channel_slice)
 
-    # rescale 0-1 to uint bounds
-    lower = 10**lower_cutoff_log
-    upper = 10**upper_cutoff_log
-    channel = (channel-lower) / (upper-lower)
+    # Normalize linear pixel values between lower and upper percentile bounds
+    # lower = np.rint(10**lower_cutoff_log)
+    # upper = np.rint(10**upper_cutoff_log)
+    # channel_slice = (channel_slice-lower) / (upper-lower)
 
-    return channel
+    # Normalize linear pixel values between lower and upper contrast settings
+    lower = contrast_limits[channel_name][0]
+    upper = contrast_limits[channel_name][1]
+    channel_slice = (channel_slice-lower) / (upper-lower)
+
+    return channel_slice
 
 
-def DecodeVectors(X_encoded, orig_input_dims, thumb_channels_to_view):
-
-    # map colors onto channels_to_view
-    channel_color_dict = {}
-    palette = list(plt.cm.get_cmap('tab10').colors)
-    for name, color in zip(thumb_channels_to_view, palette):
-        channel_color_dict[name] = (channel_dict[name], color)
+def DecodeVectors(X_encoded, X_seg, orig_input_dims, channel_color_dict, intensity_multiplier):
 
     # initialize a numpy array to store reconstructed thumbnails
     X_decoded = np.empty(
         shape=(0, orig_input_dims[0], orig_input_dims[1], 3))
 
-    for j in X_encoded:
+    for encode, seg in zip(X_encoded, X_seg):
 
-        z_sample = np.array([j])
+        # select segmentation outlines slice
+        seg_slice = seg[:, :, 0]
+
+        # ensure segmentation outlines are normalized 0-1
+        seg_slice = (seg_slice - np.min(seg_slice))/np.ptp(seg_slice)
+
+        # convert segmentation thumbnail to RGB
+        # and add to blank image
+        seg_slice = gray2rgb(seg_slice) * 0.25  # decrease alpha
+
+        z_sample = np.array([encode])
 
         decoded = decoder.predict(z_sample)
 
@@ -92,19 +112,29 @@ def DecodeVectors(X_encoded, orig_input_dims, thumb_channels_to_view):
             (reconstructed_img.shape[0],
              reconstructed_img.shape[1]))
 
+        # add centroid point at the center of the image
+        overlay[
+            int(reconstructed_img.shape[0]/2):int(
+                reconstructed_img.shape[0]/2)+1,
+            int(reconstructed_img.shape[1]/2):int(
+                reconstructed_img.shape[1]/2)+1
+            ] = 1
+
         overlay = gray2rgb(overlay)
 
         for name, (ch, color) in channel_color_dict.items():
 
-            channel = reconstructed_img[:, :, ch]
+            channel_slice = reconstructed_img[:, :, ch]
 
-            channel = reverse_log(channel)
+            channel_slice = reverse_log(channel_slice, name)
 
-            channel = gray2rgb(channel)
+            channel_slice = gray2rgb(channel_slice)
 
-            channel = (channel * color)
+            channel_slice = channel_slice * intensity_multiplier
 
-            overlay += channel
+            overlay += channel_slice * to_rgb(color)
+
+        overlay += seg_slice
 
         overlay = overlay.reshape(
             (1, orig_input_dims[0], orig_input_dims[1], 3)
@@ -112,17 +142,17 @@ def DecodeVectors(X_encoded, orig_input_dims, thumb_channels_to_view):
 
         X_decoded = np.concatenate((X_decoded, overlay), axis=0)
 
-    return X_decoded, channel_color_dict
+    return X_decoded
 
 
 def ScatterReconstructions(X_decoded, X_encoded_embedded, zoom, ax):
 
-    def imscatter(x, y, ax, imageData, zoom, intensity_multiplier):
+    def imscatter(x, y, ax, imageData, zoom):
 
         images = []
         for i in range(len(x)):
             x0, y0 = x[i], y[i]
-            img = imageData[i] * intensity_multiplier
+            img = imageData[i]
             image = OffsetImage(img, zoom=zoom)
             ab = AnnotationBbox(
                 image, (x0, y0), xycoords='data', frameon=False)
@@ -133,7 +163,7 @@ def ScatterReconstructions(X_decoded, X_encoded_embedded, zoom, ax):
 
     imscatter(
         X_encoded_embedded[:, 0], X_encoded_embedded[:, 1],
-        imageData=X_decoded, ax=ax, zoom=zoom, intensity_multiplier=3.0)
+        imageData=X_decoded, ax=ax, zoom=zoom)
 
 
 def PlotLatentSpace(reconstructions, zoom, X_encoded_embedded, X_decoded, y, channel_color_dict, scatter_point_size, filename):
@@ -166,42 +196,104 @@ def PlotLatentSpace(reconstructions, zoom, X_encoded_embedded, X_decoded, y, cha
 
         plt.grid(False)
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f'{filename}.pdf'))
+        plt.savefig(os.path.join(save_dir, f'{filename}.png'), dpi=800)
         plt.close('all')
 
     else:
-        num_labels = len(np.unique(y))
-        num_colors = plt.cm.get_cmap('tab20').N
-        palette_multiplier = ceil(num_labels/num_colors)
-        palette = [(0.0, 0.0, 0.0)]
-        palette.extend(list(plt.cm.get_cmap('tab20').colors))
-        palette = palette * palette_multiplier
+        # if VAE clustering
+        if isinstance(y, np.ndarray):
+            num_labels = len(np.unique(y))
+            num_colors = plt.cm.get_cmap('tab20').N
+            palette_multiplier = ceil(num_labels/num_colors)
+            palette = []
+            palette.extend(list(plt.cm.get_cmap('tab20').colors))
+            palette = palette * palette_multiplier
+            palette.insert(0, (0.0, 0.0, 0.0))
+            trim = len(palette)-num_labels
+            palette = palette[:-trim]
 
-        label_color_dict = dict(zip(sorted(np.unique(y)), palette))
+            label_color_dict = dict(zip(sorted(np.unique(y)), palette))
+            c = [label_color_dict[i] for i in y]
 
-        legend_elements = []
-        for lbl, color in label_color_dict.items():
+            legend_elements = []
+            for lbl, color in label_color_dict.items():
 
-            legend_elements.append(
-                Line2D([0], [0], marker='o', color='w',
-                       label=lbl, markerfacecolor=color,
-                       markeredgecolor='k', lw=0.25, markersize=15)
-                       )
+                legend_elements.append(
+                    Line2D([0], [0], marker='o', color='w',
+                           label=lbl, markerfacecolor=color,
+                           markeredgecolor='k', lw=0.25, markersize=7)
+                           )
 
-        plt.scatter(
-            X_encoded_embedded[:, 0],
-            X_encoded_embedded[:, 1],
-            c=[label_color_dict[i] for i in y],
-            ec='k', lw=0.25, s=scatter_point_size
-            )
+            plt.scatter(
+                X_encoded_embedded[:, 0],
+                X_encoded_embedded[:, 1],
+                c=c, ec='k', lw=0.0, s=scatter_point_size
+                )
 
-        plt.legend(
-            handles=legend_elements, labelspacing=0.8,
-            bbox_to_anchor=(1.12, 1.0)
-            )
+            plt.legend(
+                handles=legend_elements, fontsize=9.2, labelspacing=0.005,
+                bbox_to_anchor=(1.12, 1.01)
+                )
+        else:
+            # consensus HDBSCAN clustering
+            # build cmap
+            cmap = categorical_cmap(
+                numUniqueSamples=len(y.unique()),
+                numCatagories=10,
+                cmap='tab10',
+                continuous=False
+                )
+
+            label_color_dict = dict(
+                zip(natsorted(y.unique()), [tuple(i) for i in cmap.colors])
+                )
+
+            if '-1' in y.unique():
+                # make black the first color to specify
+                # cluster outliers (i.e. cluster -1 cells)
+                cmap = ListedColormap(
+                    np.insert(
+                        arr=cmap.colors, obj=0,
+                        values=[0.0, 0.0, 0.0], axis=0)
+                        )
+
+                # trim qualitative cmap to number of unique samples
+                cmap = ListedColormap(cmap.colors[:-1])
+
+            hue_dict = dict(
+                zip(
+                    natsorted(y.unique()),
+                    list(range(len(y.unique()))))
+                    )
+
+            c = [hue_dict[i] for i in y]
+
+            plt.scatter(
+                X_encoded_embedded[:, 0],
+                X_encoded_embedded[:, 1],
+                c=c, cmap=cmap, ec='k',
+                lw=0.0, s=scatter_point_size
+                )
+
+            legend_elements = []
+            for e, i in enumerate(
+                natsorted(y.unique())
+              ):
+
+                legend_elements.append(
+                    Line2D([0], [0], marker='o', color='w', label=i,
+                           markerfacecolor=cmap.colors[e], markeredgecolor='k',
+                           lw=0.25, markersize=9)
+                           )
+
+            plt.legend(
+                handles=legend_elements, labelspacing=0.15,
+                bbox_to_anchor=(1.12, 1.0)
+                )
 
         plt.grid(False)
-        plt.savefig(os.path.join(save_dir, f'{filename}.pdf'))
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'{filename}.png'), dpi=800)
         plt.close('all')
 
         return label_color_dict
@@ -389,7 +481,9 @@ def InterpolationGrid(orig_input_dims, grid_size, X_encoded, y, decoder, label_c
         labelpad=10, fontweight='normal')
 
     plt.savefig(
-        os.path.join(save_dir, 'InterpolationGrid.pdf'), bbox_inches='tight')
+        os.path.join(save_dir, 'InterpolationGrid.png'),
+        dpi=800, bbox_inches='tight'
+        )
     plt.close('all')
 
     return global_x_min, global_x_max, global_y_min, global_y_max, scatter_df
@@ -452,7 +546,7 @@ class SelectFromCollection(object):
         self.canvas.draw_idle()
 
 
-def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_encoded_embedded, X_decoded, y, numColumns, intensity_multiplier, max_examples, label_color_dict, channel_color_dict, thumbnail_font_size):
+def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_seg, X_encoded, X_encoded_embedded, X_decoded, y, numColumns, intensity_multiplier, max_examples, label_color_dict, channel_color_dict, thumbnail_font_size):
 
     lasso_dict = {}
 
@@ -510,24 +604,19 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
             num_labels = len(np.unique(y))
             num_colors = plt.cm.get_cmap('tab20').N
             palette_multiplier = ceil(num_labels/num_colors)
-            palette = [(0.0, 0.0, 0.0)]
+            palette = []
             palette.extend(list(plt.cm.get_cmap('tab20').colors))
             palette = palette * palette_multiplier
+            palette.insert(0, (0.0, 0.0, 0.0))
+            trim = len(palette)-num_labels
+            palette = palette[:-trim]
 
             label_color_dict = dict(zip(sorted(np.unique(y)), palette))
-
-            c = [
-                'k' if i == -1 else label_color_dict[i] for
-                i in clustering.labels_
-                ]
+            c = [label_color_dict[i] for i in y]
 
             legend_elements = []
             for i in np.unique(clustering.labels_):
-                if i == -1:
-                    markerfacecolor = 'k'
-                else:
-                    markerfacecolor = label_color_dict[i]
-
+                markerfacecolor = label_color_dict[i]
                 legend_elements.append(
                     Line2D([0], [0], marker='o', color='w',
                            label=i, markerfacecolor=markerfacecolor,
@@ -539,7 +628,6 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
 
             legend_elements = []
             for name, color in label_color_dict.items():
-
                 legend_elements.append(
                     Line2D([0], [0], marker='o', color='w',
                            label=name, markerfacecolor=color,
@@ -589,6 +677,7 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
             n=max_examples, random_state=44)
 
     selected_vectors.sort_values(by='cluster', inplace=True)
+    X_seg = X_seg[selected_vectors.index]
 
     # check cell images
     numSamples = len(selected_vectors)
@@ -612,7 +701,9 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
             grid_dims[0], grid_dims[1],
             subplot_spec=outer[panel], wspace=0.1, hspace=0.0)
 
-        for e, row in enumerate(selected_vectors.iterrows()):
+        for e, (row, seg) in enumerate(
+          zip(selected_vectors.iterrows(), X_seg)
+          ):
 
             ax = plt.Subplot(fig, inner[e])
             ax.set_xticks([])
@@ -624,6 +715,16 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
             ax.spines['bottom'].set_visible(False)
             ax.spines['left'].set_visible(False)
 
+            # select segmentation outlines slice
+            seg_slice = seg[:, :, 0]
+
+            # ensure segmentation outlines are normalized 0-1
+            seg_slice = (seg_slice - np.min(seg_slice))/np.ptp(seg_slice)
+
+            # convert segmentation thumbnail to RGB
+            # and add to blank image
+            seg_slice = gray2rgb(seg_slice) * 0.25  # decrease alpha
+
             if panel == 0:
 
                 input_img = row[1]['input_img'].reshape(
@@ -634,19 +735,27 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
                     (input_img.shape[0],
                      input_img.shape[1]))
 
+                # add centroid point at the center of the image
+                overlay[
+                    int(input_img.shape[0]/2):int(input_img.shape[0]/2)+1,
+                    int(input_img.shape[1]/2):int(input_img.shape[1]/2)+1
+                    ] = 1
+
                 overlay = gray2rgb(overlay)
 
                 for name, (ch, color) in channel_color_dict.items():
 
                     channel_slice = input_img[:, :, ch]
 
-                    channel_slice = reverse_log(channel_slice)
+                    channel_slice = reverse_log(channel_slice, name)
 
                     channel_slice = gray2rgb(channel_slice)
 
                     channel_slice = channel_slice * intensity_multiplier
 
-                    overlay += channel_slice * color
+                    overlay += channel_slice * to_rgb(color)
+
+                overlay += seg_slice
 
             elif panel == 1:
 
@@ -662,19 +771,29 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
                      reconstructed_img.shape[1])
                      )
 
+                # add centroid point at the center of the image
+                overlay[
+                    int(reconstructed_img.shape[0]/2):int(
+                        reconstructed_img.shape[0]/2)+1,
+                    int(reconstructed_img.shape[1]/2):int(
+                        reconstructed_img.shape[1]/2)+1
+                    ] = 1
+
                 overlay = gray2rgb(overlay)
 
                 for name, (ch, color) in channel_color_dict.items():
 
                     channel_slice = reconstructed_img[:, :, ch]
 
-                    channel_slice = reverse_log(channel_slice)
+                    channel_slice = reverse_log(channel_slice, name)
 
                     channel_slice = gray2rgb(channel_slice)
 
                     channel_slice = channel_slice * intensity_multiplier
 
-                    overlay += channel_slice * color
+                    overlay += channel_slice * to_rgb(color)
+
+                overlay += seg_slice
 
             ax.imshow(overlay, cmap=plt.cm.binary)
 
@@ -699,12 +818,13 @@ def LassoVectors(orig_input_dims, imgs_instead_of_points, zoom, X, X_encoded, X_
         handles=legend_elements, prop={'size': 5}, bbox_to_anchor=(0.98, 0.95))
 
     plt.savefig(
-        os.path.join(save_dir, 'lassoed_cells.pdf'), bbox_inches='tight'
+        os.path.join(save_dir, 'lassoed_cells.png'),
+        dpi=800, bbox_inches='tight'
         )
     plt.close('all')
 
 
-def PlotReconstructedImages(orig_input_dims, X, X_encoded, y, numColumns, label_color_dict, channel_color_dict, intensity_multiplier, thumbnail_font_size, filename):
+def PlotReconstructedImages(orig_input_dims, X, X_seg, X_encoded, y, numColumns, label_color_dict, channel_color_dict, intensity_multiplier, thumbnail_font_size, filename):
 
     numSamples = len(X)
     numRows = ceil(numSamples/numColumns)
@@ -728,7 +848,9 @@ def PlotReconstructedImages(orig_input_dims, X, X_encoded, y, numColumns, label_
             grid_dims[0], grid_dims[1],
             subplot_spec=outer[panel], wspace=0.1, hspace=0.0)
 
-        for e, (i, j, k) in enumerate(zip(X, X_encoded, y.iteritems())):
+        for e, (trans, encode, label, seg) in enumerate(
+          zip(X, X_encoded, y.iteritems(), X_seg)
+          ):
 
             ax = plt.Subplot(fig, inner[e])
             ax.set_xticks([])
@@ -740,27 +862,45 @@ def PlotReconstructedImages(orig_input_dims, X, X_encoded, y, numColumns, label_
             ax.spines['bottom'].set_visible(False)
             ax.spines['left'].set_visible(False)
 
+            # select segmentation outlines slice
+            seg_slice = seg[:, :, 0]
+
+            # ensure segmentation outlines are normalized 0-1
+            seg_slice = (seg_slice - np.min(seg_slice))/np.ptp(seg_slice)
+
+            # convert segmentation thumbnail to RGB
+            # and add to blank image
+            seg_slice = gray2rgb(seg_slice) * 0.25  # decrease alpha
+
             if panel == 0:
 
-                overlay = np.zeros((i.shape[0], i.shape[1]))
+                overlay = np.zeros((trans.shape[0], trans.shape[1]))
+
+                # add centroid point at the center of the image
+                overlay[
+                    int(trans.shape[0]/2):int(trans.shape[0]/2)+1,
+                    int(trans.shape[1]/2):int(trans.shape[1]/2)+1
+                    ] = 1
 
                 overlay = gray2rgb(overlay)
 
                 for name, (ch, color) in channel_color_dict.items():
 
-                    channel_slice = i[:, :, ch]
+                    channel_slice = trans[:, :, ch]
 
-                    channel_slice = reverse_log(channel_slice)
+                    channel_slice = reverse_log(channel_slice, name)
 
                     channel_slice = gray2rgb(channel_slice)
 
                     channel_slice = channel_slice * intensity_multiplier
 
-                    overlay += channel_slice * color
+                    overlay += channel_slice * to_rgb(color)
+
+                overlay += seg_slice
 
             elif panel == 1:
 
-                z_sample = np.array([j])
+                z_sample = np.array([encode])
 
                 x_decoded = decoder.predict(z_sample)
 
@@ -772,24 +912,34 @@ def PlotReconstructedImages(orig_input_dims, X, X_encoded, y, numColumns, label_
                      reconstructed_img.shape[1])
                      )
 
+                # add centroid point at the center of the image
+                overlay[
+                    int(reconstructed_img.shape[0]/2):int(
+                        reconstructed_img.shape[0]/2)+1,
+                    int(reconstructed_img.shape[1]/2):int(
+                        reconstructed_img.shape[1]/2)+1
+                    ] = 1
+
                 overlay = gray2rgb(overlay)
 
                 for name, (ch, color) in channel_color_dict.items():
 
                     channel_slice = reconstructed_img[:, :, ch]
 
-                    channel_slice = reverse_log(channel_slice)
+                    channel_slice = reverse_log(channel_slice, name)
 
                     channel_slice = gray2rgb(channel_slice)
 
                     channel_slice = channel_slice * intensity_multiplier
 
-                    overlay += channel_slice * color
+                    overlay += channel_slice * to_rgb(color)
+
+                overlay += seg_slice
 
             ax.imshow(overlay, cmap=plt.cm.binary)
 
             ax.set_xlabel(
-                k[1], fontsize=thumbnail_font_size, labelpad=0.75
+                label[1], fontsize=thumbnail_font_size, labelpad=0.75
                 )
             fig.add_subplot(ax)
 
@@ -808,11 +958,13 @@ def PlotReconstructedImages(orig_input_dims, X, X_encoded, y, numColumns, label_
     fig.legend(
         handles=legend_elements, prop={'size': 5}, bbox_to_anchor=(0.98, 0.95))
 
-    plt.savefig(os.path.join(save_dir, f'{filename}.pdf'), bbox_inches='tight')
+    plt.savefig(
+        os.path.join(save_dir, f'{filename}.png'), dpi=800, bbox_inches='tight'
+        )
     plt.close('all')
 
 
-def mse(orig_input_dims, X, X_encoded, y, mse_percentile_cutoff, filename):
+def mse(orig_input_dims, X, X_seg, X_encoded, y, mse_percentile_cutoff, filename):
 
     errors = []
 
@@ -835,78 +987,86 @@ def mse(orig_input_dims, X, X_encoded, y, mse_percentile_cutoff, filename):
 
     n, bins, pathes = plt.hist(errors, bins=50)
     plt.axvline(np.percentile(errors, mse_percentile_cutoff), c='r')
-    plt.savefig(os.path.join(save_dir, f'{filename}.pdf'))
+    plt.savefig(os.path.join(save_dir, f'{filename}.png'), dpi=800)
 
     outlier_idxs = [
         i for i, v in enumerate(errors)
         if v > np.percentile(errors, mse_percentile_cutoff)]
 
     X_outliers = X[outlier_idxs]
+    X_outliers_seg = X_seg[outlier_idxs]
     X_encoded_outliers = X_encoded[outlier_idxs]
     y_outliers = y[outlier_idxs].reset_index(drop=True)
 
     plt.close('all')
 
-    return average_error, errors, X_outliers, X_encoded_outliers, y_outliers, outlier_idxs
+    return average_error, errors, X_outliers, X_outliers_seg, X_encoded_outliers, y_outliers, outlier_idxs
 
 
-# def PlotInputImgs(orig_input_dims, numExamples, numColumns, X, y, channel_color_dict, thumbnail_font_size, filename):
-#
-#     numSamples = len(X)
-#     numRows = ceil(numSamples/numColumns)
-#     grid_dims = (numRows, numColumns)
-#
-#     # numColumns = math.ceil(numExamples/numRows)
-#     # grid_dims = (numRows, numColumns)
-#
-#     ordered_lbs = natsorted(y)
-#     # ordered_lbs = y
-#
-#     # sns.set_style('whitegrid')
-#     fig = plt.figure(figsize=(20, 10))
-#
-#     for e, i in enumerate(ordered_lbs):
-#
-#         plt.subplot(grid_dims[0], grid_dims[1], e + 1)
-#         plt.xticks([])
-#         plt.yticks([])
-#         plt.grid(False)
-#
-#         # initialize array of zeros with shape of full-size image
-#         overlay = np.zeros((orig_input_dims[0], orig_input_dims[1]))
-#         overlay = gray2rgb(overlay)
-#
-#         for name, (ch, color) in channel_color_dict.items():
-#             channel_slice = X[e, :, :, ch]
-#             channel_slice = gray2rgb(channel_slice)
-#             channel_slice = channel_slice * color
-#             overlay += channel_slice
-#         plt.imshow(overlay, cmap=plt.cm.binary)
-#         plt.xlabel(i, size=thumbnail_font_size, labelpad=3.0)
-#
-#     legend_elements = []
-#     for name, (ch, color) in channel_color_dict.items():
-#         legend_elements.append(Line2D([0], [0], color=color, lw=5, label=name))
-#
-#     fig.legend(
-#         handles=legend_elements, prop={'size': 11}, bbox_to_anchor=(0.97, 0.89)
-#         )
-#
-#     plt.savefig(os.path.join(save_dir, f'{filename}.pdf'))
-#     plt.close('all')
+def categorical_cmap(numUniqueSamples, numCatagories, cmap='tab10', continuous=False):
+
+    numSubcatagories = math.ceil(numUniqueSamples/numCatagories)
+
+    if numCatagories > plt.get_cmap(cmap).N:
+        raise ValueError('Too many categories for colormap.')
+    if continuous:
+        ccolors = plt.get_cmap(cmap)(np.linspace(0, 1, numCatagories))
+    else:
+        ccolors = plt.get_cmap(cmap)(np.arange(numCatagories, dtype=int))
+        # rearrange hue order to taste
+        cd = {
+            'B': 0, 'O': 1, 'G': 2, 'R': 3, 'Pu': 4,
+            'Br': 5, 'Pi': 6, 'Gr': 7, 'Y': 8, 'Cy': 9,
+            }
+        myorder = [
+            cd['B'], cd['O'], cd['G'], cd['Pu'], cd['Y'],
+            cd['R'], cd['Cy'], cd['Br'], cd['Gr'], cd['Pi']
+            ]
+        ccolors = [ccolors[i] for i in myorder]
+
+        # use Okabe and Ito color-safe palette for first 6 colors
+        # ccolors[0] = np.array([0.91, 0.29, 0.235]) #E84A3C
+        # ccolors[1] = np.array([0.18, 0.16, 0.15]) #2E2926
+        ccolors[0] = np.array([0.0, 0.447, 0.698, 1.0])  # blue
+        ccolors[1] = np.array([0.902, 0.624, 0.0, 1.0])  # orange
+        ccolors[2] = np.array([0.0, 0.620, 0.451, 1.0])  # bluish green
+        ccolors[3] = np.array([0.8, 0.475, 0.655, 1.0])  # reddish purple
+        ccolors[4] = np.array([0.941, 0.894, 0.259, 1.0])  # yellow
+        ccolors[5] = np.array([0.835, 0.369, 0.0, 1.0])  # vermillion
+
+    cols = np.zeros((numCatagories * numSubcatagories, 3))
+    for i, c in enumerate(ccolors):
+        chsv = colors.rgb_to_hsv(c[:3])
+        arhsv = np.tile(chsv, numSubcatagories).reshape(numSubcatagories, 3)
+        arhsv[:, 1] = np.linspace(chsv[1], 0.25, numSubcatagories)
+        arhsv[:, 2] = np.linspace(chsv[2], 1, numSubcatagories)
+        rgb = colors.hsv_to_rgb(arhsv)
+        cols[i * numSubcatagories:(i + 1) * numSubcatagories, :] = rgb
+    cmap = colors.ListedColormap(cols)
+
+    # trim colors if necessary
+    if len(cmap.colors) > numUniqueSamples:
+        trim = len(cmap.colors) - numUniqueSamples
+        cmap_colors = cmap.colors[:-trim]
+        cmap = colors.ListedColormap(cmap_colors, name='from_list', N=None)
+
+    return cmap
+
+
+cluster_full_dataset = False  # cluster training, validation, and test data
 
 latent_dim = 850  # should be the same as that used for training
 training_thumb_dims = (30, 30, 21)
 embedding_algorithm = 'UMAP'  # 'TSNE'
 
-# read percentile cutoffs selected in script 3_feature_preprocessing
+# read percentile cutoffs selected in script 4_feature_preprocessing_selections
 with open(
-  '/Users/greg/projects/vae_sardana-097/4_feature_preprocessing_selections'
+  '/Users/greg/projects/vae/output/4_feature_preprocessing_selections'
   '/cutoffs.pkl',
   'rb') as handle:
     cutoffs = pickle.load(handle)
 
-# complete list of ordered channels in thumbnail data
+# complete list of ordered channels VAE input data
 markers = [
     'anti_CD3', 'anti_CD45RO', 'Keratin_570', 'aSMA_660', 'CD4_488',
     'CD45_PE', 'PD1_647', 'CD20_488', 'CD68_555', 'CD8a_660', 'CD163_488',
@@ -915,29 +1075,39 @@ markers = [
     ]
 channel_dict = dict(zip(markers, range(len(markers))))
 
-thumb_channels_to_view = [
-    'Keratin_570', 'CD20_488', 'aSMA_660', 'CD4_488', 'CD8a_660',
-    'FOXP3_570', 'PCNA_488', 'CD68_555', 'Ecad_488'
-    ]
-thumb_channels_to_view = [
-    'Keratin_570', 'CD8a_660', 'CD4_488', 'CD163_488', 'Vimentin_555',
-    ]
-
+channel_color_dict = {
+    'Keratin_570': (2, 'tab:blue'),
+    'aSMA_660': (3, 'tab:orange'),
+    'CD4_488': (4, 'tab:red'),
+    'CD20_488': (7, 'tab:olive'),
+    'CD8a_660': (9, 'tab:green'),
+    'CD163_488': (10, 'tab:purple'),
+    'FOXP3_570': (11, 'tab:cyan'),
+    'PCNA_488': (19, 'tab:pink')
+    }
 ###############################################################################
 
 # save directory
 save_dir = (
-    f'/Users/greg/projects/vae_sardana-097/6_latent_space_LD{latent_dim}/'
+    f'/Users/greg/projects/vae/output/6_latent_space_LD{latent_dim}/'
     )
 if not os.path.exists(save_dir):
     os.mkdir(save_dir)
+
+# read SARDANA-097 image contrast settings (defined in CyLinter)
+contrast_dir = (
+    '/Volumes/My Book/cylinter_input/clean_quant/output_3d_v2/contrast/'
+    )
+if os.path.exists(f'{contrast_dir}/contrast_limits.yml'):
+    contrast_limits = yaml.safe_load(
+        open(f'{contrast_dir}/contrast_limits.yml'))
 
 ###############################################################################
 
 # load previously saved encoder and decoders
 try:
     encoder = load_model(
-        '/Users/greg/projects/vae_sardana-097/5_train_vae/encoder.hdf5'
+        '/Users/greg/projects/vae/output/5_train_vae/encoder.hdf5'
         )
 except OSError:
     print('Encoder not found.')
@@ -945,57 +1115,169 @@ except OSError:
 
 try:
     decoder = load_model(
-        '/Users/greg/projects/vae_sardana-097/5_train_vae/decoder.hdf5'
+        '/Users/greg/projects/vae/output/5_train_vae/decoder.hdf5'
         )
 except OSError:
     print('Decoder not found.')
     sys.exit()
 
 ###############################################################################
+# read training labels
+y_train = pd.read_csv(
+    '/Users/greg/projects/vae/output/1_cellcutter_input/train.csv'
+    )
+
+# read training thumbnails (16-bit unsigned integer format)
+z1_train_path = (
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
+    'train_thumbnails_30'
+    )
+X_train = zarr.open(z1_train_path)
+
+# read segmentation thumbnails for training data (16-bit unsigned integer)
+z1_train_path_seg = (
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
+    'train_thumbnails_30_seg'
+    )
+X_train_seg = zarr.open(z1_train_path_seg)
+
+# read validation labels
+y_validate = pd.read_csv(
+    '/Users/greg/projects/vae/output/1_cellcutter_input/validate.csv'
+    )
+
+# read validation thumbnails (16-bit unsigned integer format)
+z1_validate_path = (
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
+    'validate_thumbnails_30'
+    )
+X_validate = zarr.open(z1_validate_path)
+
+# read segmentation thumbnails for validation data (16-bit unsigned integer)
+z1_validate_path_seg = (
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
+    'validate_thumbnails_30_seg'
+    )
+X_validate_seg = zarr.open(z1_validate_path_seg)
 
 # read test labels
 y_test = pd.read_csv(
-    '/Users/greg/projects/vae_sardana-097/1_cellcutter_input/test.csv'
+    '/Users/greg/projects/vae/output/1_cellcutter_input/test.csv'
     )
 
-# read floating point test thumbnails
+# read test thumbnails (16-bit unsigned integer format)
 z1_test_path = (
-    '/Users/greg/projects/vae_sardana-097/2_cellcutter_output_win30/' +
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
     'test_thumbnails_30'
     )
 X_test = zarr.open(z1_test_path)
 
-# take a sample of thumbnail data
-# X_test1 = X_test[:, 0:47991, :, :]
-# y_test1 = y_test[0:47991]
+# read segmentation thumbnails for test data (16-bit unsigned integer)
+z1_test_path_seg = (
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
+    'test_thumbnails_30_seg'
+    )
+X_test_seg = zarr.open(z1_test_path_seg)
 
-X_test1 = X_test[:, 0:5000, :, :]
-y_test1 = y_test[0:5000]
+###############################################################################
 
-# convert back to Zarr format after slicing
-z = zarr.zeros(
-    shape=(X_test1.shape[0], X_test1.shape[1],
-           X_test1.shape[2], X_test1.shape[3]),
-    chunks=(X_test.chunks[0], X_test.chunks[1],
-            X_test.chunks[2], X_test.chunks[3]),
-    compressor=X_test.compressor,
-    dtype='float32'
-            )
-z[:] = X_test1
+# take a sample of test thumbnail data for analysis
 
 # rearrange Zarr dimensions to fit shape of expected VAE input
 # (i.e. cells, x, y, channels)
-X_test1 = transposeZarr(z=z)
+X_test1 = transposeZarr(z=X_test)
+X_test1 = X_test1[0:2000]
 
-# load data into memory
-X_test1 = X_test1[:]
+X_test1_seg = transposeZarr(z=X_test_seg)
+X_test1_seg = X_test1_seg[0:2000]
 
-# read percentile cutoffs selected in script 3_feature_preprocessing
-with open(
-  '/Users/greg/projects/vae_sardana-097/4_feature_preprocessing_selections'
-  '/cutoffs.pkl',
-  'rb') as handle:
-    cutoffs = pickle.load(handle)
+y_test1 = y_test[0:2000]
+
+###############################################################################
+
+combo_dir = os.path.join(save_dir, 'combined_zarr')
+combo_dir_seg = os.path.join(save_dir, 'combined_zarr_seg')
+
+if not os.path.exists(combo_dir):
+    os.makedirs(combo_dir)
+
+    print('Combined data does not exist, creating...')
+
+    # initialize combo zarr to store combined train, validate, test data
+    X_combo = zarr.open(
+        combo_dir,
+        mode='w',
+        shape=(
+            X_train.shape[0], X_train.shape[1],
+            X_train.shape[2], X_train.shape[3]
+            ),
+        chunks=(
+            X_train.chunks[0], X_train.chunks[1],
+            X_train.chunks[2], X_train.chunks[3]
+            ),
+        compressor=X_train.compressor,
+        dtype=X_train.dtype
+        )
+    X_combo[:] = X_train
+    # concatenate validation and test data to training data
+    X_combo.append(X_validate, axis=1)
+    X_combo.append(X_test, axis=1)
+else:
+    # read combined thumbnails
+    X_combo = zarr.open(combo_dir)
+
+if not os.path.exists(combo_dir_seg):
+    os.makedirs(combo_dir_seg)
+
+    print('Combined segmentation outlines does not exist, creating...')
+
+    # initialize combo zarr to store combined train, validate, test data
+    X_combo_seg = zarr.open(
+        combo_dir_seg,
+        mode='w',
+        shape=(
+            X_train_seg.shape[0], X_train_seg.shape[1],
+            X_train_seg.shape[2], X_train_seg.shape[3]
+            ),
+        chunks=(
+            X_train_seg.chunks[0], X_train_seg.chunks[1],
+            X_train_seg.chunks[2], X_train_seg.chunks[3]
+            ),
+        compressor=X_train_seg.compressor,
+        dtype=X_train_seg.dtype
+        )
+    X_combo_seg[:] = X_train_seg
+    # concatenate validation and test data to training data
+    X_combo_seg.append(X_validate_seg, axis=1)
+    X_combo_seg.append(X_test_seg, axis=1)
+else:
+    # read combined thumbnails
+    X_combo_seg = zarr.open(combo_dir_seg)
+
+###############################################################################
+
+if cluster_full_dataset:
+    print()
+    print('Aggregating combined training, validation, and test data.')
+
+    # rearrange Zarr dimensions to fit shape of expected VAE input
+    # (i.e. cells, x, y, channels)
+    X_test1 = transposeZarr(z=X_combo)
+    X_test1_seg = transposeZarr(z=X_combo_seg)
+
+    # load data into memory
+    X_test1 = X_test1[:]
+    X_test1_seg = X_test1_seg[:]
+
+    # combine labels for train, validate, and test data
+    y_test1 = pd.concat([y_train, y_validate, y_test], axis=0)
+
+y_test1['cluster'].replace(
+    to_replace={47: '4.7', 413: '4.13', 416: '4.16'}, inplace=True
+    )
+y_test1['cluster'] = y_test1['cluster'].astype('str')
+
+###############################################################################
 
 # log10 transform
 X_test1 = np.log10(X_test1, where=(X_test1 != 0))
@@ -1007,14 +1289,15 @@ for i in range(X_test1.shape[0]):
 
         # scale 0.17th and 99.99th percentile between 0 and 1
         X_test1[i, :, :, e] = (
-            (((1-0)*(X_test1[i, :, :, e].ravel()-lower_cutoff_log)) /
+            (((1-0)*(X_test1[i, :, :, e]-lower_cutoff_log)) /
              (upper_cutoff_log-lower_cutoff_log)
-             ) + 0).reshape(X_test1[i, :, :, e].shape)
+             ) + 0)
 
         # clip lower and upper outliers to 0 and 1, respectively
         X_test1[i, :, :, e] = np.clip(
             a=X_test1[i, :, :, e], a_min=0, a_max=1
             )
+
 ###############################################################################
 
 # encode test images
@@ -1023,13 +1306,13 @@ X_encoded = EncodeImgs(X=X_test1, encoder=encoder)
 ###############################################################################
 # embed latent vectors if they are greater than 2D
 
-embedding_path = (
-    '/Users/greg/projects/vae_sardana-097/6_latent_space/embedding.npy'
-    )
+embedding_path = os.path.join(save_dir, 'embedding.npy')
 
 if (latent_dim > 2) and not os.path.exists(embedding_path):
 
     startTime = datetime.now()
+
+    print('Embedding data...')
 
     if embedding_algorithm == 'TSNE':
         print('Computing TSNE embedding.')
@@ -1046,12 +1329,12 @@ if (latent_dim > 2) and not os.path.exists(embedding_path):
         print('Computing UMAP embedding.')
         X_encoded_embedded = UMAP(
             n_components=2,
-            n_neighbors=6,
+            n_neighbors=30,
             learning_rate=1.0,
             output_metric='euclidean',
             min_dist=0.1,
-            repulsion_strength=7,
-            random_state=4,
+            repulsion_strength=3,
+            random_state=3,
             n_epochs=1000,
             init='spectral',
             metric='euclidean',
@@ -1083,12 +1366,13 @@ if (latent_dim > 2) and not os.path.exists(embedding_path):
             disconnection_distance=None,
             output_dens=False).fit_transform(X_encoded)
 
-    print('Embedding completed in ' + str(datetime.now() - startTime))
+        print('Embedding completed in ' + str(datetime.now() - startTime))
 
     # save embedding
     np.save(os.path.join(save_dir, 'embedding'), X_encoded_embedded)
 
 elif (latent_dim > 2) and os.path.exists(embedding_path):
+    print('Loading saved embedding.')
 
     # load previously saved embedding
     X_encoded_embedded = np.load(embedding_path)
@@ -1100,7 +1384,7 @@ else:
 ###############################################################################
 
 # cluster the data with HDBSCAN
-for i in range(285, 286, 1):
+for i in range(351, 352, 1):
 
     print(f'Minimum_cluster_size is {i}')
 
@@ -1128,7 +1412,7 @@ label_color_dict = PlotLatentSpace(
     X_decoded=None,
     y=y_test1['cluster'],
     channel_color_dict=None,
-    scatter_point_size=30,
+    scatter_point_size=144000/len(X_encoded_embedded),
     filename='consensus_clustering'
     )
 
@@ -1140,14 +1424,16 @@ PlotLatentSpace(
     X_decoded=None,
     y=clustering.labels_,
     channel_color_dict=None,
-    scatter_point_size=30,
+    scatter_point_size=144000/len(X_encoded_embedded),
     filename='latent_clustering'
     )
 
 # reconstruct thumbnail images from latent vectors
-X_decoded, channel_color_dict = DecodeVectors(
-    X_encoded=X_encoded, orig_input_dims=training_thumb_dims,
-    thumb_channels_to_view=thumb_channels_to_view
+X_decoded = DecodeVectors(
+    X_encoded=X_encoded, X_seg=X_test1_seg,
+    orig_input_dims=training_thumb_dims,
+    channel_color_dict=channel_color_dict,
+    intensity_multiplier=1.1
     )
 
 # plot latent vectors represented as their learned reconstructions
@@ -1158,7 +1444,7 @@ PlotLatentSpace(
     X_decoded=X_decoded,
     y=y_test1['cluster'],
     channel_color_dict=channel_color_dict,
-    scatter_point_size=30,
+    scatter_point_size=144000/len(X_encoded_embedded),
     filename='thumbnails'
     )
 
@@ -1174,7 +1460,7 @@ if latent_dim == 2:
         label_color_dict=label_color_dict,
         channel_color_dict=channel_color_dict,
         frac_of_scatter_points=1.0,
-        scatter_point_size=30.0,
+        scatter_point_size=144000/len(X_encoded_embedded),
         make_sample_sizes_equal=False,
         img_brightness_multiplier=1.2,
         scatter_point_alpha=1.0,
@@ -1186,12 +1472,13 @@ LassoVectors(
     imgs_instead_of_points=True,
     zoom=0.5,
     X=X_test1,
+    X_seg=X_test1_seg,
     X_encoded=X_encoded,
     X_encoded_embedded=X_encoded_embedded,
     X_decoded=X_decoded,
     y=y_test1['cluster'],
     numColumns=10,
-    intensity_multiplier=3.0,
+    intensity_multiplier=1.1,
     label_color_dict=label_color_dict,
     channel_color_dict=channel_color_dict,
     max_examples=1000,
@@ -1201,12 +1488,13 @@ LassoVectors(
 PlotReconstructedImages(
     orig_input_dims=training_thumb_dims,
     X=X_test1[0:100],
+    X_seg=X_test1_seg[0:100],
     X_encoded=X_encoded[0:100],
     y=y_test1['cluster'][0:100],
     numColumns=10,
     label_color_dict=label_color_dict,
     channel_color_dict=channel_color_dict,
-    intensity_multiplier=3.0,
+    intensity_multiplier=1.1,
     thumbnail_font_size=3.0,
     filename='learned_reconstructions'
     )
@@ -1215,11 +1503,13 @@ PlotReconstructedImages(
 (average_error,
     errors,
     X_outliers,
+    X_outliers_seg,
     X_encoded_outliers,
     y_outliers,
     outlier_idxs) = mse(
         orig_input_dims=training_thumb_dims,
         X=X_test1,
+        X_seg=X_test1_seg,
         X_encoded=X_encoded,
         y=y_test1['cluster'],
         mse_percentile_cutoff=99,
@@ -1230,12 +1520,13 @@ PlotReconstructedImages(
 PlotReconstructedImages(
     orig_input_dims=training_thumb_dims,
     X=X_outliers,
+    X_seg=X_outliers_seg,
     X_encoded=X_encoded_outliers,
     y=y_outliers,
     numColumns=10,
     label_color_dict=label_color_dict,
     channel_color_dict=channel_color_dict,
-    intensity_multiplier=3.0,
+    intensity_multiplier=1.0,
     thumbnail_font_size=3.0,
     filename='outliers'
     )

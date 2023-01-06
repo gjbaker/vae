@@ -1,5 +1,6 @@
 # VAE output directory
 output/
+manuscript/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

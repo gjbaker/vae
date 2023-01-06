@@ -119,7 +119,7 @@ channel_ids = [13, 2, 3, 4, 7, 9, 11, 14]
 ###############################################################################
 
 # save directory
-save_dir = ('/Users/greg/projects/vae_sardana-097/3_thumbnail_examples')
+save_dir = ('/Users/greg/projects/vae/output/3_thumbnail_examples')
 if not os.path.exists(save_dir):
     os.mkdir(save_dir)
 
@@ -127,12 +127,12 @@ if not os.path.exists(save_dir):
 
 # read training labels
 labels = pd.read_csv(
-    '/Users/greg/projects/vae_sardana-097/1_cellcutter_input/train.csv'
+    '/Users/greg/projects/vae/output/1_cellcutter_input/train.csv'
     )
 
 # read training images
 z_path = (
-    '/Users/greg/projects/vae_sardana-097/2_cellcutter_output_win30/' +
+    '/Users/greg/projects/vae/output/2_cellcutter_output_win30/' +
     'train_thumbnails_30'
     )
 z = zarr.open(z_path, mode='r')

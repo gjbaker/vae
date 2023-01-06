@@ -6,9 +6,7 @@ import matplotlib.pyplot as plt
 import pickle
 
 # save directory
-save_dir = (
-    '/Users/greg/projects/vae_sardana-097/4_feature_preprocessing_selections'
-    )
+save_dir = '/Users/greg/projects/vae/output/4_feature_preprocessing_selections'
 if not os.path.exists(save_dir):
     os.mkdir(save_dir)
 
@@ -25,6 +23,7 @@ cellcutter_markers = [
 
 ###############################################
 
+# format plot grid
 numRows = 4
 numColumns = 6
 grid_dims = (numRows, numColumns)
@@ -60,17 +59,17 @@ for e, marker in enumerate(cellcutter_markers):
     cutoffs[marker] = (lower_cutoff_log, upper_cutoff_log)
 
     # scale 0.17th and 99.99th percentile between 0 and 1
-    # Note: this will cause outlier pixels below the 0.1th percentile and above
-    # the 99.9th to take values <0 and >1, respectively
+    # Note: this will cause outlier pixels below the 0.17th percentile and above
+    # the 99.99th to take values <0 and >1, respectively
     rescaled_log_img = (
-        (((1-0)*(log_img.ravel()-lower_cutoff_log)) /
+        (((1-0)*(log_img-lower_cutoff_log)) /
          (upper_cutoff_log-lower_cutoff_log)
-         ) + 0).reshape(log_img.shape)
+         ) + 0)
 
     # clip outliers to lower and upper percentile cutoffs (i.e., 0-1)
     clip_rescaled_log_img = np.clip(a=rescaled_log_img, a_min=0, a_max=1)
 
-    # add channel subplot to both figures
+    # add channel subplot to figures
     ax_orig = fig_orig.add_subplot(grid_dims[0], grid_dims[1], e + 1)
     ax_log = fig_log.add_subplot(grid_dims[0], grid_dims[1], e + 1)
     ax_clip = fig_clip.add_subplot(grid_dims[0], grid_dims[1], e + 1)
@@ -92,7 +91,7 @@ for e, marker in enumerate(cellcutter_markers):
            )
     ax_log.title.set_text(marker)
 
-    # plot new channel histogram
+    # plot normalized channel histogram
     vals, bins, patches = ax_clip.hist(
         clip_rescaled_log_img.ravel(), bins=60,
         color='tab:blue', alpha=0.7, rwidth=0.85
